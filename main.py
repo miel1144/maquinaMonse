@@ -23,12 +23,16 @@ from datetime import datetime
 
 from fastapi import FastAPI, HTTPException, Depends, Header
 from sqlmodel import SQLModel, Field, create_engine, Session, select
+# Del simulador
+import asyncio
+from simulador import router as router_simulador, bucle_simulador
 
 # ---------------------------------------------------------------------------
 # 1. BASE DE DATOS
 # ---------------------------------------------------------------------------
 DATABASE_URL = "sqlite:///./maquinamonse.db"
 engine = create_engine(DATABASE_URL, echo=False)
+
 
 
 def crear_tablas():
@@ -110,12 +114,35 @@ def verificar_api_key(x_api_key: str = Header(...)):
 # ---------------------------------------------------------------------------
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    """
+    Arranque y apagado de la aplicación.
+
+    OJO: el bucle del simulador se lanza AQUÍ y no con @app.on_event("startup").
+    Cuando se le pasa lifespan= al constructor de FastAPI, los manejadores
+    registrados con on_event NO SE EJECUTAN NUNCA -- Starlette solo los corre
+    cuando no hay un lifespan propio. Como esta app sí tiene uno (para
+    crear_tablas), el on_event quedaba muerto sin ningún error visible: el
+    endpoint respondía, pero los acumulados se quedaban congelados en su primer
+    valor y Monse calculaba consumo = 0 para siempre.
+    """
     crear_tablas()
-    yield
+
+    tarea = asyncio.create_task(bucle_simulador())
+    try:
+        yield
+    finally:
+        # Al apagar el servidor se cancela la tarea, para que uvicorn --reload
+        # no vaya acumulando un simulador por cada recarga.
+        tarea.cancel()
+        try:
+            await tarea
+        except asyncio.CancelledError:
+            pass
 
 
 app = FastAPI(title="MaquinaMonse", version="2.1.0", lifespan=lifespan)
 
+app.include_router(router_simulador)
 
 # ---------------------------------------------------------------------------
 # 6. ENDPOINTS — el CRUD real
