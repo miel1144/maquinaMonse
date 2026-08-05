@@ -211,6 +211,31 @@ def avanzar_simulacion(segundos: float | None = None) -> None:
     Se calcula con el tiempo REAL transcurrido y no con INTERVALO_SEGUNDOS fijo:
     si el proceso se pausa o el equipo se suspende, el acumulado sigue siendo
     coherente con el reloj en vez de quedarse corto.
+
+    BUG CORREGIDO -- redondeo prematuro del acumulado:
+    Antes esta función hacía
+        _acumulados[clave] = round(_acumulados.get(clave, 0.0) + incremento, 4)
+    o sea, redondeaba a 4 decimales el TOTAL acumulado en cada tick, no solo
+    al exponerlo. Con una máquina de poca potencia y un tipo de energía de
+    tasa baja (agua: 0.012 m3/hora por unidad de potencia), el incremento de
+    un solo tick puede ser menor a 0.00005 -- por ejemplo, una Prensa de
+    4.5 kW en turno nocturno suma ~0.000026 m3 cada 5 s. Redondeado a 4
+    decimales, eso es 0.0000: el acumulado nunca sale de 0, así que el
+    siguiente tick le vuelve a sumar a un cero "recién redondeado" y el
+    resultado se vuelve a redondear a cero -- un acumulador que
+    matemáticamente NO PUEDE despegar nunca, sin importar cuánto tiempo
+    pase. Con electricidad (tasa 0.85) o incluso con gas (0.040) el
+    incremento por tick casi siempre supera el umbral de redondeo, por eso
+    esas dos sí crecían con normalidad y agua se quedaba pegada en 0.0000
+    -- no era falta de tiempo, era un acumulador que se resetea solo en
+    cada paso.
+
+    La corrección: el acumulado en memoria se queda con precisión completa
+    de float (sin redondear), y el redondeo a 4 decimales se aplica UNA
+    SOLA VEZ, al final, cuando se expone en el endpoint /api/maquinas/
+    lecturas (ver lecturas() más abajo) -- ahí sí no importa, porque para
+    ese momento ya se compusieron miles de incrementos pequeños en un
+    número lo bastante grande para que 4 decimales no se lo coman.
     """
     global _ultimo_tick
 
@@ -235,7 +260,9 @@ def avanzar_simulacion(segundos: float | None = None) -> None:
             incremento = base * (1 + random.uniform(-RUIDO, RUIDO))
 
             clave = (codigo, tipo)
-            _acumulados[clave] = round(_acumulados.get(clave, 0.0) + max(incremento, 0.0), 4)
+            # SIN round() aquí -- ver el comentario grande más abajo, en
+            # "BUG: redondeo prematuro del acumulado".
+            _acumulados[clave] = _acumulados.get(clave, 0.0) + max(incremento, 0.0)
 
 
 async def bucle_simulador() -> None:
@@ -293,7 +320,12 @@ def lecturas():
         salida.append({
             'codigo_interno': codigo,
             'cod_tipo_energia': tipo,
-            'valor_acumulado': valor,
+            # El redondeo a 4 decimales se hace AQUÍ, una sola vez, sobre el
+            # total ya compuesto -- no en cada tick (ver el bug explicado en
+            # avanzar_simulacion). Para este momento el acumulado ya es lo
+            # bastante grande para que 4 decimales no se coman incrementos
+            # enteros.
+            'valor_acumulado': round(valor, 4),
             'unidad': PERFILES[tipo]['unidad'],
         })
 
