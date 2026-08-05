@@ -66,6 +66,76 @@ RUIDO = 0.02
 _acumulados: dict[tuple[str, str], float] = {}
 _ultimo_tick: datetime | None = None
 
+# Cada cuántos ticks se persiste _acumulados a la tabla Acumulado (SQLite,
+# durable). Persistir cada 5 s (cada tick) es I/O de sobra para lo que se
+# gana: el peor caso de esperar más es perder el acumulado de los últimos
+# ~60 s si el proceso muere entre persistencias -- mucho mejor que perderlo
+# TODO, que es lo que pasaba antes de agregar esta tabla.
+INTERVALO_PERSISTENCIA_TICKS = 12
+_ticks_desde_persistencia = 0
+
+
+def cargar_acumulados_desde_db() -> None:
+    """
+    Recupera _acumulados desde la tabla Acumulado al arrancar el proceso.
+
+    Se llama una vez, desde el lifespan de main.py, ANTES de lanzar
+    bucle_simulador(). Si no hay nada guardado (primera vez, o
+    maquinamonse.db nuevo), _acumulados se queda como estaba: vacío, y todo
+    arranca en 0 igual que siempre arrancó.
+
+    Import diferido por el mismo motivo que _maquinas_simuladas(): main.py
+    importa este módulo en sus primeras líneas, así que un import a nivel
+    de módulo formaría un ciclo.
+    """
+    global _acumulados
+    try:
+        from sqlmodel import Session, select
+        from main import Acumulado, engine
+
+        with Session(engine) as session:
+            filas = session.exec(select(Acumulado)).all()
+
+        if filas:
+            _acumulados = {(f.codigo_interno, f.cod_tipo_energia): f.valor_acumulado for f in filas}
+            print(f'[simulador] {len(_acumulados)} acumulado(s) recuperado(s) de maquinamonse.db.')
+    except Exception as e:
+        print(f'[simulador] no se pudo recuperar el estado guardado, arrancando en 0: {e}')
+
+
+def guardar_acumulados() -> None:
+    """
+    Escribe el _acumulados actual en la tabla Acumulado (upsert por
+    codigo_interno + cod_tipo_energia).
+
+    Se llama periódicamente desde bucle_simulador() (cada
+    INTERVALO_PERSISTENCIA_TICKS ticks) y una vez más al apagar, desde el
+    lifespan de main.py, para no perder lo que avanzó desde la última
+    persistencia periódica.
+    """
+    if not _acumulados:
+        return
+    try:
+        from sqlmodel import Session, select
+        from main import Acumulado, engine
+
+        with Session(engine) as session:
+            for (codigo, tipo), valor in _acumulados.items():
+                fila = session.exec(
+                    select(Acumulado).where(
+                        Acumulado.codigo_interno == codigo,
+                        Acumulado.cod_tipo_energia == tipo,
+                    )
+                ).first()
+                if fila is None:
+                    fila = Acumulado(codigo_interno=codigo, cod_tipo_energia=tipo)
+                fila.valor_acumulado = valor
+                fila.actualizado_en = datetime.now(timezone.utc)
+                session.add(fila)
+            session.commit()
+    except Exception as e:
+        print(f'[simulador] no se pudo persistir el acumulado: {e}')
+
 
 def _factor_carga(momento: datetime) -> float:
     """Factor de carga según el turno en curso."""
@@ -170,9 +240,14 @@ def avanzar_simulacion(segundos: float | None = None) -> None:
 
 async def bucle_simulador() -> None:
     """Tarea de segundo plano: avanza la simulación cada INTERVALO_SEGUNDOS."""
+    global _ticks_desde_persistencia
     while True:
         try:
             avanzar_simulacion()
+            _ticks_desde_persistencia += 1
+            if _ticks_desde_persistencia >= INTERVALO_PERSISTENCIA_TICKS:
+                guardar_acumulados()
+                _ticks_desde_persistencia = 0
         except Exception as e:
             # Un error aquí NO debe matar la tarea: si se cae, el simulador deja
             # de avanzar y el endpoint devolvería siempre lo mismo sin que nada

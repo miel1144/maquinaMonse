@@ -22,10 +22,15 @@ from typing import Optional, List
 from datetime import datetime
 
 from fastapi import FastAPI, HTTPException, Depends, Header
-from sqlmodel import SQLModel, Field, create_engine, Session, select
+from sqlmodel import SQLModel, Field, create_engine, Session, select, UniqueConstraint
 # Del simulador
 import asyncio
-from simulador import router as router_simulador, bucle_simulador
+from simulador import (
+    router as router_simulador,
+    bucle_simulador,
+    cargar_acumulados_desde_db,
+    guardar_acumulados,
+)
 
 # ---------------------------------------------------------------------------
 # 1. BASE DE DATOS
@@ -69,6 +74,32 @@ class Maquina(SQLModel, table=True):
     sincronizada: bool = Field(default=False)
 
     creado_en: datetime = Field(default_factory=datetime.utcnow)
+    actualizado_en: datetime = Field(default_factory=datetime.utcnow)
+
+
+class Acumulado(SQLModel, table=True):
+    """
+    Persiste el estado del simulador (el diccionario _acumulados de
+    simulador.py) para que sobreviva a un restart de MaquinaMonse.
+
+    Antes ese diccionario vivía SOLO en memoria: al apagar y prender el
+    proceso (o cuando uvicorn --reload lo recarga por un cambio de archivo),
+    todas las máquinas volvían a arrancar desde 0. La siguiente vez que
+    Monse ingería, veía un valor mucho menor al último que tenía guardado,
+    disparaba "el contador retrocedió" y el consumo de ese ciclo salía en 0
+    -- el historial previo en Monse seguía intacto, pero la tendencia se
+    cortaba ahí y las gráficas se veían "caer a cero" después de cada
+    reinicio.
+
+    Una fila por (codigo_interno, cod_tipo_energia), igual que la llave del
+    diccionario en memoria.
+    """
+    __table_args__ = (UniqueConstraint('codigo_interno', 'cod_tipo_energia'),)
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    codigo_interno: str = Field(index=True)
+    cod_tipo_energia: str = Field(index=True)
+    valor_acumulado: float = Field(default=0.0)
     actualizado_en: datetime = Field(default_factory=datetime.utcnow)
 
 
@@ -127,6 +158,11 @@ async def lifespan(app: FastAPI):
     """
     crear_tablas()
 
+    # Recupera el estado de _acumulados guardado la última vez que el proceso
+    # se apagó -- si no hay nada guardado (primera vez, o base nueva), arranca
+    # en 0 igual que antes.
+    cargar_acumulados_desde_db()
+
     tarea = asyncio.create_task(bucle_simulador())
     try:
         yield
@@ -138,6 +174,13 @@ async def lifespan(app: FastAPI):
             await tarea
         except asyncio.CancelledError:
             pass
+
+        # Guarda el estado actual antes de cerrar del todo. bucle_simulador ya
+        # persiste periódicamente (ver INTERVALO_PERSISTENCIA_TICKS en
+        # simulador.py), pero esto cubre lo que haya avanzado desde la última
+        # persistencia periódica -- sin esto, un apagado "limpio" (Ctrl+C)
+        # podría perder hasta un minuto de acumulado igual que uno abrupto.
+        guardar_acumulados()
 
 
 app = FastAPI(title="MaquinaMonse", version="2.1.0", lifespan=lifespan)
